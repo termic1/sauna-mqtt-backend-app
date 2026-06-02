@@ -113,76 +113,54 @@ app.get("/api/device/:deviceId/status", (req, res) => {
   res.json(lastStatus.get(deviceId) || null);
 });
 
-app.post("/api/device/:deviceId/cmd/:command",express.json(), (req, res) => {
-  const { deviceId, command } = req.params;
-  const { value } = req.body;
+app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
+  const deviceId = cleanDeviceId(req.params.deviceId);
   const command = String(req.params.command || "");
   const allowedCommands = new Set(["power", "target", "timer", "irtime", "mode", "leds", "bright"]);
-  
+
   if (!deviceAllowed(deviceId)) return res.status(403).json({ error: "Device not allowed" });
   if (!allowedCommands.has(command)) return res.status(400).json({ error: "Invalid command" });
 
   let value = req.body?.value;
   if (value === undefined || value === null) return res.status(400).json({ error: "Missing value" });
 
-  // Basic safety validation before publishing to the sauna.
   if (command === "power" && !["on", "off", "true", "false", "1", "0"].includes(String(value))) {
     return res.status(400).json({ error: "Invalid power value" });
   }
+
   if (command === "target") {
     const n = Number(value);
     if (!Number.isFinite(n) || n < 90 || n > 135) return res.status(400).json({ error: "Target must be 90-135" });
     value = n;
   }
+
   if (command === "timer" || command === "irtime") {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 0 || n > 120) return res.status(400).json({ error: "Timer must be 0-120" });
     value = n;
   }
+
   if (command === "mode") {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 0 || n > 12) return res.status(400).json({ error: "Mode must be 0-12" });
     value = n;
   }
+
   if (command === "bright") {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 10 || n > 255) return res.status(400).json({ error: "Brightness must be 10-255" });
     value = n;
   }
+
   if (command === "leds" && !["on", "off", "true", "false", "1", "0"].includes(String(value))) {
     return res.status(400).json({ error: "Invalid LEDs value" });
   }
 
   const topic = `${MQTT_PREFIX}/${deviceId}/cmd/${command}`;
+
   mqttClient.publish(topic, String(value), { qos: 0, retain: false }, (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ ok: true, topic, value });
-  });
-});
-
-wss.on("connection", (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const deviceId = cleanDeviceId(url.searchParams.get("deviceId") || "");
-
-  if (!deviceAllowed(deviceId)) {
-    ws.send(JSON.stringify({ type: "error", error: "Device not allowed" }));
-    ws.close();
-    return;
-  }
-
-  if (!wsClients.has(deviceId)) wsClients.set(deviceId, new Set());
-  wsClients.get(deviceId).add(ws);
-
-  ws.send(JSON.stringify({ type: "hello", deviceId, mqttConnected: mqttClient.connected }));
-  if (lastStatus.has(deviceId)) {
-    ws.send(JSON.stringify({ type: "status", deviceId, status: lastStatus.get(deviceId) }));
-  }
-
-  ws.on("close", () => {
-    const set = wsClients.get(deviceId);
-    if (!set) return;
-    set.delete(ws);
-    if (set.size === 0) wsClients.delete(deviceId);
   });
 });
 
