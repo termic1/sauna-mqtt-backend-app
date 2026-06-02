@@ -46,7 +46,11 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-app.use(cors({ origin: ALLOWED_ORIGIN }));
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
 app.use(express.json());
 
 const lastStatus = new Map();
@@ -109,11 +113,12 @@ app.get("/api/device/:deviceId/status", (req, res) => {
   res.json(lastStatus.get(deviceId) || null);
 });
 
-app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
-  const deviceId = cleanDeviceId(req.params.deviceId);
+app.post("/api/device/:deviceId/cmd/:command",express.json(), (req, res) => {
+  const { deviceId, command } = req.params;
+  const { value } = req.body;
   const command = String(req.params.command || "");
   const allowedCommands = new Set(["power", "target", "timer", "irtime", "mode", "leds", "bright"]);
-
+  
   if (!deviceAllowed(deviceId)) return res.status(403).json({ error: "Device not allowed" });
   if (!allowedCommands.has(command)) return res.status(400).json({ error: "Invalid command" });
 
@@ -148,9 +153,10 @@ app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
     return res.status(400).json({ error: "Invalid LEDs value" });
   }
 
-  mqttClient.publish(commandTopic(deviceId, command), String(value), { qos: 0, retain: false }, (err) => {
+  const topic = `${MQTT_PREFIX}/${deviceId}/cmd/${command}`;
+  mqttClient.publish(topic, String(value), { qos: 0, retain: false }, (err) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ ok: true, topic: commandTopic(deviceId, command), value });
+    res.json({ ok: true, topic, value });
   });
 });
 
