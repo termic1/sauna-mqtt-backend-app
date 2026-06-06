@@ -116,7 +116,16 @@ app.get("/api/device/:deviceId/status", (req, res) => {
 app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
   const deviceId = cleanDeviceId(req.params.deviceId);
   const command = String(req.params.command || "");
-  const allowedCommands = new Set(["power", "target", "timer", "irtime", "mode", "leds", "bright"]);
+  const allowedCommands = new Set([
+  "power",
+  "target",
+  "timer",
+  "irtime",
+  "mode",
+  "leds",
+  "bright",
+  "room"
+]);
 
   if (!deviceAllowed(deviceId)) return res.status(403).json({ error: "Device not allowed" });
   if (!allowedCommands.has(command)) return res.status(400).json({ error: "Invalid command" });
@@ -128,11 +137,13 @@ app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
     return res.status(400).json({ error: "Invalid power value" });
   }
 
-  if (command === "target") {
-    const n = Number(value);
-    if (!Number.isFinite(n) || n < 90 || n > 135) return res.status(400).json({ error: "Target must be 90-135" });
-    value = n;
+if (command === "target") {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 120 || n > 220) {
+    return res.status(400).json({ error: "Target must be 120-220" });
   }
+  value = n;
+}
 
   if (command === "timer" || command === "irtime") {
     const n = Number(value);
@@ -151,6 +162,14 @@ app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
     if (!Number.isInteger(n) || n < 10 || n > 255) return res.status(400).json({ error: "Brightness must be 10-255" });
     value = n;
   }
+
+if (command === "room") {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 3) {
+    return res.status(400).json({ error: "Room must be 1, 2, or 3" });
+  }
+  value = n;
+}
 
   if (command === "leds" && !["on", "off", "true", "false", "1", "0"].includes(String(value))) {
     return res.status(400).json({ error: "Invalid LEDs value" });
