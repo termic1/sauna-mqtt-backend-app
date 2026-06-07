@@ -5,6 +5,7 @@ import mqtt from "mqtt";
 import { WebSocketServer } from "ws";
 import http from "http";
 
+// Load secrets from server/.env. Never put this file in GitHub.
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3001);
@@ -12,8 +13,7 @@ const MQTT_URL = process.env.MQTT_URL;
 const MQTT_USER = process.env.MQTT_USER;
 const MQTT_PASS = process.env.MQTT_PASS;
 const MQTT_PREFIX = process.env.MQTT_PREFIX || "geysersteam";
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "http://localhost:5173";
 const ALLOWED_DEVICE_IDS = (process.env.ALLOWED_DEVICE_IDS || "")
   .split(",")
   .map((x) => cleanDeviceId(x))
@@ -34,32 +34,38 @@ function deviceAllowed(deviceId) {
   return ALLOWED_DEVICE_IDS.includes(deviceId);
 }
 
+function statusTopic(deviceId) {
+  return `${MQTT_PREFIX}/${deviceId}/status`;
+}
+
+function commandTopic(deviceId, command) {
+  return `${MQTT_PREFIX}/${deviceId}/cmd/${command}`;
+}
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 app.use(cors({
-  origin: ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN,
+  origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
-
 app.use(express.json());
 
 const lastStatus = new Map();
-const wsClients = new Map();
+const wsClients = new Map(); // deviceId -> Set<WebSocket>
 
 const mqttClient = mqtt.connect(MQTT_URL, {
   username: MQTT_USER,
   password: MQTT_PASS,
   clientId: `sauna-backend-${Math.random().toString(16).slice(2)}`,
   reconnectPeriod: 3000,
-  clean: true
+  clean: true,
 });
 
 mqttClient.on("connect", () => {
   console.log("MQTT connected");
-
   mqttClient.subscribe(`${MQTT_PREFIX}/+/status`, (err) => {
     if (err) console.error("MQTT subscribe failed:", err.message);
     else console.log(`Subscribed to ${MQTT_PREFIX}/+/status`);
@@ -86,167 +92,84 @@ mqttClient.on("message", (topic, payload) => {
 
   parsed._deviceId = deviceId;
   parsed._receivedAt = new Date().toISOString();
-
   lastStatus.set(deviceId, parsed);
 
   const clients = wsClients.get(deviceId);
   if (!clients) return;
 
-  const msg = JSON.stringify({
-    type: "status",
-    deviceId,
-    status: parsed
-  });
-
+  const msg = JSON.stringify({ type: "status", deviceId, status: parsed });
   for (const ws of clients) {
     if (ws.readyState === ws.OPEN) ws.send(msg);
   }
 });
 
-wss.on("connection", (ws) => {
-  let subscribedDeviceId = null;
-
-  ws.on("message", (raw) => {
-    let msg;
-
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      ws.send(JSON.stringify({ type: "error", error: "Invalid JSON" }));
-      return;
-    }
-
-    if (msg.type !== "subscribe") return;
-
-    const deviceId = cleanDeviceId(msg.deviceId);
-
-    if (!deviceAllowed(deviceId)) {
-      ws.send(JSON.stringify({ type: "error", error: "Device not allowed" }));
-      return;
-    }
-
-    subscribedDeviceId = deviceId;
-
-    if (!wsClients.has(deviceId)) {
-      wsClients.set(deviceId, new Set());
-    }
-
-    wsClients.get(deviceId).add(ws);
-
-    const status = lastStatus.get(deviceId);
-    if (status) {
-      ws.send(JSON.stringify({
-        type: "status",
-        deviceId,
-        status
-      }));
-    }
-  });
-
-  ws.on("close", () => {
-    if (!subscribedDeviceId) return;
-
-    const clients = wsClients.get(subscribedDeviceId);
-    if (!clients) return;
-
-    clients.delete(ws);
-
-    if (clients.size === 0) {
-      wsClients.delete(subscribedDeviceId);
-    }
-  });
-});
-
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    mqttConnected: mqttClient.connected,
-    wsDevices: wsClients.size
-  });
+  res.json({ ok: true, mqttConnected: mqttClient.connected });
 });
 
 app.get("/api/device/:deviceId/status", (req, res) => {
   const deviceId = cleanDeviceId(req.params.deviceId);
-
-  if (!deviceAllowed(deviceId)) {
-    return res.status(403).json({ error: "Device not allowed" });
-  }
-
+  if (!deviceAllowed(deviceId)) return res.status(403).json({ error: "Device not allowed" });
   res.json(lastStatus.get(deviceId) || null);
 });
 
 app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
   const deviceId = cleanDeviceId(req.params.deviceId);
   const command = String(req.params.command || "");
-
   const allowedCommands = new Set([
-    "power",
-    "target",
-    "timer",
-    "irtime",
-    "mode",
-    "leds",
-    "bright",
-    "room"
-  ]);
+  "power",
+  "target",
+  "timer",
+  "irtime",
+  "mode",
+  "leds",
+  "bright",
+  "room"
+]);
 
-  if (!deviceAllowed(deviceId)) {
-    return res.status(403).json({ error: "Device not allowed" });
-  }
-
-  if (!allowedCommands.has(command)) {
-    return res.status(400).json({ error: "Invalid command" });
-  }
+  if (!deviceAllowed(deviceId)) return res.status(403).json({ error: "Device not allowed" });
+  if (!allowedCommands.has(command)) return res.status(400).json({ error: "Invalid command" });
 
   let value = req.body?.value;
-
-  if (value === undefined || value === null) {
-    return res.status(400).json({ error: "Missing value" });
-  }
+  if (value === undefined || value === null) return res.status(400).json({ error: "Missing value" });
 
   if (command === "power" && !["on", "off", "true", "false", "1", "0"].includes(String(value))) {
     return res.status(400).json({ error: "Invalid power value" });
   }
 
-  if (command === "target") {
-    const n = Number(value);
-    if (!Number.isFinite(n) || n < 120 || n > 220) {
-      return res.status(400).json({ error: "Target must be 120-220" });
-    }
-    value = n;
+if (command === "target") {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 120 || n > 220) {
+    return res.status(400).json({ error: "Target must be 120-220" });
   }
+  value = n;
+}
 
   if (command === "timer" || command === "irtime") {
     const n = Number(value);
-    if (!Number.isInteger(n) || n < 0 || n > 120) {
-      return res.status(400).json({ error: "Timer must be 0-120" });
-    }
+    if (!Number.isInteger(n) || n < 0 || n > 120) return res.status(400).json({ error: "Timer must be 0-120" });
     value = n;
   }
 
   if (command === "mode") {
     const n = Number(value);
-    if (!Number.isInteger(n) || n < 0 || n > 12) {
-      return res.status(400).json({ error: "Mode must be 0-12" });
-    }
+    if (!Number.isInteger(n) || n < 0 || n > 12) return res.status(400).json({ error: "Mode must be 0-12" });
     value = n;
   }
 
   if (command === "bright") {
     const n = Number(value);
-    if (!Number.isInteger(n) || n < 10 || n > 255) {
-      return res.status(400).json({ error: "Brightness must be 10-255" });
-    }
+    if (!Number.isInteger(n) || n < 10 || n > 255) return res.status(400).json({ error: "Brightness must be 10-255" });
     value = n;
   }
 
-  if (command === "room") {
-    const n = Number(value);
-    if (!Number.isInteger(n) || n < 1 || n > 3) {
-      return res.status(400).json({ error: "Room must be 1, 2, or 3" });
-    }
-    value = n;
+if (command === "room") {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 3) {
+    return res.status(400).json({ error: "Room must be 1, 2, or 3" });
   }
+  value = n;
+}
 
   if (command === "leds" && !["on", "off", "true", "false", "1", "0"].includes(String(value))) {
     return res.status(400).json({ error: "Invalid LEDs value" });
@@ -256,15 +179,10 @@ app.post("/api/device/:deviceId/cmd/:command", (req, res) => {
 
   mqttClient.publish(topic, String(value), { qos: 0, retain: false }, (err) => {
     if (err) return res.status(500).json({ error: err.message });
-
-    res.json({
-      ok: true,
-      topic,
-      value
-    });
+    res.json({ ok: true, topic, value });
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`Backend running on port ${PORT}`);
+  console.log(`Backend running on http://localhost:${PORT}`);
 });
