@@ -199,3 +199,4 @@ app.post("/api/device/:deviceId/settings",(req,res) => {
 });
 
 server.listen(PORT,()=>console.log(`Backend running on port ${PORT}`));
+
