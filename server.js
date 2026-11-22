@@ -16,7 +16,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const ICEMAKER_PREFIX = "geysericemaker";
 const iceStatuses = new Map();
 const iceWsClients = new Map();
-const ICE_COMMANDS = Object.freeze({power: null, mode:[0,12], leds:null, bright:[10,255], drytime:[5,300], icingtime:[10,900], deliverytime:[5,300], flush:null, displaybright:[10,255], overheatthresh:[30,120]});
+const ICE_COMMANDS = Object.freeze({stopaftercycle:null, power: null, mode:[0,12], leds:null, bright:[10,255], drytime:[5,300], icingtime:[10,900], deliverytime:[5,300], flush:null, displaybright:[10,255], overheatthresh:[30,120]});
 function cleanDeviceId(id = "") { return String(id).replace(/[^a-fA-F0-9]/g, "").toUpperCase(); }
 const ALLOWED_DEVICE_IDS = (process.env.ALLOWED_DEVICE_IDS || "").split(",").map(cleanDeviceId).filter(Boolean);
 function deviceAllowed(id) { return id.length === 12 && (ALLOWED_DEVICE_IDS.length === 0 || ALLOWED_DEVICE_IDS.includes(id)); }
@@ -109,6 +109,12 @@ app.post("/api/icemaker/:deviceId/cmd/:command", (req,res) => {
   if (value===undefined || value===null) return res.status(400).json({error:"Missing value"});
   if (command==="power" || command==="leds") {
     if (!["on","off"].includes(String(value))) return res.status(400).json({error:"Expected on or off"});
+  } else if (command==="stopaftercycle") {
+    if (!["request","cancel"].includes(String(value)))
+      return res.status(400).json({error:"Expected request or cancel"});
+    const st=iceStatuses.get(id);
+    if (value==="request" && !booleanValue(st.on))
+      return res.status(409).json({error:"Ice Maker is not running"});
   } else if (command==="flush") {
     if (!["arm","confirm","stop"].includes(String(value))) return res.status(400).json({error:"Expected arm, confirm, or stop"});
     const st=iceStatuses.get(id);
