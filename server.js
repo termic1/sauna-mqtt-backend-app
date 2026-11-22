@@ -13,6 +13,10 @@ const MQTT_USER = process.env.MQTT_USER;
 const MQTT_PASS = process.env.MQTT_PASS;
 const MQTT_PREFIX = process.env.MQTT_PREFIX || "geysersteam";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ICEMAKER_PREFIX = "geysericemaker";
+const iceStatuses = new Map();
+const iceWsClients = new Map();
+const ICE_COMMANDS = Object.freeze({power: null, mode:[0,12], leds:null, bright:[10,255], drytime:[5,300], icingtime:[10,900], deliverytime:[5,300], flush:null, displaybright:[10,255], overheatthresh:[30,120]});
 function cleanDeviceId(id = "") { return String(id).replace(/[^a-fA-F0-9]/g, "").toUpperCase(); }
 const ALLOWED_DEVICE_IDS = (process.env.ALLOWED_DEVICE_IDS || "").split(",").map(cleanDeviceId).filter(Boolean);
 function deviceAllowed(id) { return id.length === 12 && (ALLOWED_DEVICE_IDS.length === 0 || ALLOWED_DEVICE_IDS.includes(id)); }
@@ -25,17 +29,18 @@ if (!MQTT_URL || !MQTT_USER || !MQTT_PASS) { console.error("Missing MQTT_URL, MQ
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
-app.use(cors({ origin: ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN, methods:["GET","POST","OPTIONS"], allowedHeaders:["Content-Type"] }));
+const allowedOrigins = ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN.split(",").map(x => x.trim()).filter(Boolean);
+app.use(cors({ origin: allowedOrigins, methods:["GET","POST","OPTIONS"], allowedHeaders:["Content-Type"] }));
 app.use(express.json({ limit: "16kb" }));
 const lastStatus = new Map();
 const wsClients = new Map();
 const pendingSettingsVerifications = new Map();
 const mqttClient = mqtt.connect(MQTT_URL, { username: MQTT_USER, password: MQTT_PASS, clientId:`sauna-backend-${randomInt(0x7fffffff).toString(16)}`, reconnectPeriod:3000, clean:true });
-mqttClient.on("connect", () => { console.log("MQTT connected"); mqttClient.subscribe(`${MQTT_PREFIX}/+/status`, err => { if (err) console.error("MQTT subscribe failed:",err.message); else console.log(`Subscribed to ${MQTT_PREFIX}/+/status`); }); });
+mqttClient.on("connect", () => { console.log("MQTT connected"); mqttClient.subscribe([`${MQTT_PREFIX}/+/status`, `${ICEMAKER_PREFIX}/+/status`], err => { if (err) console.error("MQTT subscribe failed:",err.message); else console.log("Subscribed to Sauna and Ice Maker status topics"); }); });
 mqttClient.on("error", err => console.error("MQTT error:",err.message));
 mqttClient.on("message", (topic,payload) => {
   const parts = topic.split("/");
-  if (parts.length!==3 || parts[0]!==MQTT_PREFIX || parts[2]!=="status") return;
+  if (parts.length!==3 || ![MQTT_PREFIX, ICEMAKER_PREFIX].includes(parts[0]) || parts[2]!=="status") return;
   const deviceId = cleanDeviceId(parts[1]);
   if (!deviceAllowed(deviceId)) return;
   let parsed;
@@ -43,13 +48,14 @@ mqttClient.on("message", (topic,payload) => {
   if (!parsed || typeof parsed!=="object" || Array.isArray(parsed)) return;
   parsed._deviceId=deviceId;
   parsed._receivedAt=new Date().toISOString();
-  lastStatus.set(deviceId,parsed);
-  if (parsed.settingsVerifyNonce!==undefined) {
+  const isIce = parts[0] === ICEMAKER_PREFIX;
+  (isIce ? iceStatuses : lastStatus).set(deviceId,parsed);
+  if (!isIce && parsed.settingsVerifyNonce!==undefined) {
     const key=`${deviceId}:${Number(parsed.settingsVerifyNonce)}`;
     const pending=pendingSettingsVerifications.get(key);
     if (pending) { clearTimeout(pending.timer); pendingSettingsVerifications.delete(key); pending.resolve(booleanValue(parsed.settingsVerifyValid)); }
   }
-  const clients=wsClients.get(deviceId);
+  const clients=(isIce ? iceWsClients : wsClients).get(deviceId);
   if (!clients) return;
   const msg=JSON.stringify({type:"status",deviceId,status:parsed});
   for (const ws of clients) if (ws.readyState===ws.OPEN) ws.send(msg);
@@ -62,18 +68,22 @@ wss.on("connection", ws => {
     try { msg=JSON.parse(raw.toString()); } catch { ws.send(JSON.stringify({type:"error",error:"Invalid JSON"})); return; }
     if (msg?.type!=="subscribe") return;
     const deviceId=cleanDeviceId(msg.deviceId);
+    const isIce = msg.product === "icemaker";
+    const clientMap = isIce ? iceWsClients : wsClients;
     if (!deviceAllowed(deviceId)) { ws.send(JSON.stringify({type:"error",error:"Device not allowed"})); return; }
-    if (subscribedDeviceId && wsClients.has(subscribedDeviceId)) {
-      const previous=wsClients.get(subscribedDeviceId); previous.delete(ws);
-      if (!previous.size) wsClients.delete(subscribedDeviceId);
+    if (subscribedDeviceId) {
+      const oldMap = ws._iceSubscription ? iceWsClients : wsClients;
+      const previous=oldMap.get(subscribedDeviceId);
+      if (previous) { previous.delete(ws); if (!previous.size) oldMap.delete(subscribedDeviceId); }
     }
     subscribedDeviceId=deviceId;
-    if (!wsClients.has(deviceId)) wsClients.set(deviceId,new Set());
-    wsClients.get(deviceId).add(ws);
-    const status=lastStatus.get(deviceId);
+    ws._iceSubscription=isIce;
+    if (!clientMap.has(deviceId)) clientMap.set(deviceId,new Set());
+    clientMap.get(deviceId).add(ws);
+    const status=(isIce ? iceStatuses : lastStatus).get(deviceId);
     if (status) ws.send(JSON.stringify({type:"status",deviceId,status}));
   });
-  ws.on("close", () => { if (!subscribedDeviceId) return; const clients=wsClients.get(subscribedDeviceId); if (clients) { clients.delete(ws); if (!clients.size) wsClients.delete(subscribedDeviceId); } });
+  ws.on("close", () => { if (!subscribedDeviceId) return; const clientMap=ws._iceSubscription ? iceWsClients : wsClients; const clients=clientMap.get(subscribedDeviceId); if (clients) { clients.delete(ws); if (!clients.size) clientMap.delete(subscribedDeviceId); } });
 });
 
 app.get("/api/health", (_req,res) => res.json({ok:true,mqttConnected:mqttClient.connected,wsDevices:wsClients.size}));
@@ -81,6 +91,37 @@ app.get("/api/device/:deviceId/status", (req,res) => {
   const id=cleanDeviceId(req.params.deviceId);
   if (!deviceAllowed(id)) return res.status(403).json({error:"Device not allowed"});
   return res.json(lastStatus.get(id)||null);
+});
+
+// Separate Ice Maker API. Sauna endpoints and MQTT command semantics remain unchanged.
+app.get("/api/icemaker/:deviceId/status", (req,res) => {
+  const id=cleanDeviceId(req.params.deviceId);
+  if (!deviceAllowed(id)) return res.status(403).json({error:"Device not allowed"});
+  return res.json(iceStatuses.get(id)||null);
+});
+app.post("/api/icemaker/:deviceId/cmd/:command", (req,res) => {
+  const id=cleanDeviceId(req.params.deviceId);
+  if (!deviceAllowed(id)) return res.status(403).json({error:"Device not allowed"});
+  const command=String(req.params.command||"");
+  if (!Object.prototype.hasOwnProperty.call(ICE_COMMANDS,command)) return res.status(400).json({error:"Unsupported Ice Maker command"});
+  if (!iceStatuses.has(id)) return res.status(409).json({error:"Ice Maker status not received yet"});
+  let value=req.body?.value;
+  if (value===undefined || value===null) return res.status(400).json({error:"Missing value"});
+  if (command==="power" || command==="leds") {
+    if (!["on","off"].includes(String(value))) return res.status(400).json({error:"Expected on or off"});
+  } else if (command==="flush") {
+    if (!["arm","confirm","stop"].includes(String(value))) return res.status(400).json({error:"Expected arm, confirm, or stop"});
+    const st=iceStatuses.get(id);
+    if (value!=="stop" && (booleanValue(st.on) || booleanValue(st.ohAlarm))) return res.status(409).json({error:"Flush unavailable while machine is running or overheat alarm is active"});
+    // Firmware enforces the arm/confirm window; status can lag the arm command.
+  } else {
+    const [min,max]=ICE_COMMANDS[command];
+    const n=Number(value);
+    if (!Number.isFinite(n) || n<min || n>max || (command!=="overheatthresh" && !Number.isInteger(n)))
+      return res.status(400).json({error:`Invalid ${command}: expected ${min} to ${max}`});
+    value=n;
+  }
+  return publishCommand(`${ICEMAKER_PREFIX}/${id}/cmd/${command}`,String(value),res);
 });
 
 function publishCommand(topic,value,res) {
@@ -199,4 +240,3 @@ app.post("/api/device/:deviceId/settings",(req,res) => {
 });
 
 server.listen(PORT,()=>console.log(`Backend running on port ${PORT}`));
-
