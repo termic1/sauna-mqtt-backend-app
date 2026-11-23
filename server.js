@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import mqtt from "mqtt";
 import { WebSocketServer } from "ws";
 import http from "http";
-import { randomInt } from "node:crypto";
+import { randomInt, randomBytes } from "node:crypto";
 
 dotenv.config();
 const PORT = Number(process.env.PORT || 3001);
@@ -16,6 +16,53 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const ICEMAKER_PREFIX = "geysericemaker";
 const iceStatuses = new Map();
 const iceWsClients = new Map();
+// Ice Maker passwords and equipment profile are owned by ESP32 NVS (firmware 1.1.4+).
+// Sessions are ephemeral; the backend never writes passwords to retained MQTT topics.
+const iceProfiles = new Map();
+const iceSessions = new Map();
+const iceLoginAttempts = new Map();
+const iceVerifyPending = new Map();
+const iceProfilePending = new Map();
+const ICE_SESSION_MS = 30 * 60 * 1000;
+function getIceProfile(id) { return iceProfiles.get(id) || {model:"",location:"",manufactured:"",capacity:0}; }
+function publicIceProfile(p) { return {model:p.model||"",location:p.location||"",manufactured:p.manufactured||"",capacity:Number(p.capacity)||0}; }
+function iceSession(req,id) {
+  const token=String(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
+  const session=iceSessions.get(token);
+  if (!session || session.id!==id || session.expires<Date.now()) {iceSessions.delete(token);return null;}
+  session.expires=Date.now()+ICE_SESSION_MS;
+  return session;
+}
+function iceRequireAuth(req,res,id) {
+  const session=iceSession(req,id);
+  if (!session) res.status(401).json({error:"Settings session expired. Sign in again."});
+  return session;
+}
+function verifyIcePassword(id,password) {
+  if (!mqttClient.connected) return Promise.reject(new Error("MQTT broker disconnected"));
+  if (!iceStatuses.has(id)) return Promise.reject(new Error("Ice Maker is offline or has not reported status"));
+  const nonce=randomInt(1,0xffffffff);
+  const key=`${id}:${nonce}`;
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{iceVerifyPending.delete(key);reject(new Error("ESP32 did not answer password verification"));},8000);
+    iceVerifyPending.set(key,{resolve,reject,timer});
+    mqttClient.publish(`${ICEMAKER_PREFIX}/${id}/cmd/settings/verify`,JSON.stringify({password,nonce}),{qos:1,retain:false},err=>{
+      if(err){clearTimeout(timer);iceVerifyPending.delete(key);reject(err);}
+    });
+  });
+}
+function awaitIceProfile(id,predicate,timeoutMs=8000) {
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{iceProfilePending.delete(id);reject(new Error("ESP32 did not confirm the settings update"));},timeoutMs);
+    iceProfilePending.set(id,{predicate,resolve,reject,timer});
+  });
+}
+function publishIceUpdate(id,payload) {
+  return new Promise((resolve,reject)=>{
+    if (!mqttClient.connected) return reject(new Error("MQTT broker disconnected"));
+    mqttClient.publish(`${ICEMAKER_PREFIX}/${id}/cmd/settings/update`,JSON.stringify(payload),{qos:1,retain:false},err=>err?reject(err):resolve());
+  });
+}
 const ICE_COMMANDS = Object.freeze({stopaftercycle:null, power: null, mode:[0,12], leds:null, bright:[10,255], drytime:[5,300], icingtime:[10,900], deliverytime:[5,300], flush:null, displaybright:[10,255], overheatthresh:[30,120]});
 function cleanDeviceId(id = "") { return String(id).replace(/[^a-fA-F0-9]/g, "").toUpperCase(); }
 const ALLOWED_DEVICE_IDS = (process.env.ALLOWED_DEVICE_IDS || "").split(",").map(cleanDeviceId).filter(Boolean);
@@ -30,35 +77,48 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const allowedOrigins = ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN.split(",").map(x => x.trim()).filter(Boolean);
-app.use(cors({ origin: allowedOrigins, methods:["GET","POST","OPTIONS"], allowedHeaders:["Content-Type"] }));
+app.use(cors({ origin: allowedOrigins, methods:["GET","POST","PUT","OPTIONS"], allowedHeaders:["Content-Type","Authorization"] }));
 app.use(express.json({ limit: "16kb" }));
 const lastStatus = new Map();
 const wsClients = new Map();
 const pendingSettingsVerifications = new Map();
 const mqttClient = mqtt.connect(MQTT_URL, { username: MQTT_USER, password: MQTT_PASS, clientId:`sauna-backend-${randomInt(0x7fffffff).toString(16)}`, reconnectPeriod:3000, clean:true });
-mqttClient.on("connect", () => { console.log("MQTT connected"); mqttClient.subscribe([`${MQTT_PREFIX}/+/status`, `${ICEMAKER_PREFIX}/+/status`], err => { if (err) console.error("MQTT subscribe failed:",err.message); else console.log("Subscribed to Sauna and Ice Maker status topics"); }); });
+mqttClient.on("connect", () => { console.log("MQTT connected"); mqttClient.subscribe([`${MQTT_PREFIX}/+/status`, `${ICEMAKER_PREFIX}/+/status`, `${ICEMAKER_PREFIX}/+/profile`, `${ICEMAKER_PREFIX}/+/settings/verify/result`], err => { if (err) console.error("MQTT subscribe failed:",err.message); else console.log("Subscribed to Sauna and Ice Maker status topics"); }); });
 mqttClient.on("error", err => console.error("MQTT error:",err.message));
 mqttClient.on("message", (topic,payload) => {
-  const parts = topic.split("/");
-  if (parts.length!==3 || ![MQTT_PREFIX, ICEMAKER_PREFIX].includes(parts[0]) || parts[2]!=="status") return;
-  const deviceId = cleanDeviceId(parts[1]);
-  if (!deviceAllowed(deviceId)) return;
+  const parts=topic.split("/");
+  if (![MQTT_PREFIX,ICEMAKER_PREFIX].includes(parts[0])) return;
+  const id=cleanDeviceId(parts[1]);
+  if (!deviceAllowed(id)) return;
   let parsed;
   try { parsed=JSON.parse(payload.toString()); } catch { return; }
   if (!parsed || typeof parsed!=="object" || Array.isArray(parsed)) return;
-  parsed._deviceId=deviceId;
-  parsed._receivedAt=new Date().toISOString();
-  const isIce = parts[0] === ICEMAKER_PREFIX;
-  (isIce ? iceStatuses : lastStatus).set(deviceId,parsed);
-  if (!isIce && parsed.settingsVerifyNonce!==undefined) {
-    const key=`${deviceId}:${Number(parsed.settingsVerifyNonce)}`;
-    const pending=pendingSettingsVerifications.get(key);
-    if (pending) { clearTimeout(pending.timer); pendingSettingsVerifications.delete(key); pending.resolve(booleanValue(parsed.settingsVerifyValid)); }
+  if (parts[0]===ICEMAKER_PREFIX && parts.length===5 && parts.slice(2).join("/")==="settings/verify/result") {
+    const key=`${id}:${Number(parsed.settingsVerifyNonce)}`;
+    const pending=iceVerifyPending.get(key);
+    if(pending){clearTimeout(pending.timer);iceVerifyPending.delete(key);pending.resolve(parsed.settingsVerifyValid===true);}
+    return;
   }
-  const clients=(isIce ? iceWsClients : wsClients).get(deviceId);
-  if (!clients) return;
-  const msg=JSON.stringify({type:"status",deviceId,status:parsed});
-  for (const ws of clients) if (ws.readyState===ws.OPEN) ws.send(msg);
+  if (parts.length!==3) return;
+  if (parts[0]===ICEMAKER_PREFIX && parts[2]==="profile") {
+    const profile={model:String(parsed.model||"").slice(0,64),location:String(parsed.location||"").slice(0,96),manufactured:String(parsed.manufactured||"").slice(0,10),capacity:Number(parsed.capacity)||0};
+    iceProfiles.set(id,profile);
+    const pending=iceProfilePending.get(id);
+    if(pending && pending.predicate(profile)){clearTimeout(pending.timer);iceProfilePending.delete(id);pending.resolve(profile);}
+    return;
+  }
+  if(parts[2]!=="status")return;
+  parsed._deviceId=id;
+  parsed._receivedAt=new Date().toISOString();
+  const isIce=parts[0]===ICEMAKER_PREFIX;
+  (isIce?iceStatuses:lastStatus).set(id,parsed);
+  if(!isIce && parsed.settingsVerifyNonce!==undefined){
+    const key=`${id}:${Number(parsed.settingsVerifyNonce)}`;
+    const pending=pendingSettingsVerifications.get(key);
+    if(pending){clearTimeout(pending.timer);pendingSettingsVerifications.delete(key);pending.resolve(booleanValue(parsed.settingsVerifyValid));}
+  }
+  const clients=(isIce?iceWsClients:wsClients).get(id);
+  if(clients){const msg=JSON.stringify({type:"status",deviceId:id,status:parsed});for(const ws of clients)if(ws.readyState===ws.OPEN)ws.send(msg);}
 });
 
 wss.on("connection", ws => {
@@ -99,12 +159,75 @@ app.get("/api/icemaker/:deviceId/status", (req,res) => {
   if (!deviceAllowed(id)) return res.status(403).json({error:"Device not allowed"});
   return res.json(iceStatuses.get(id)||null);
 });
+// Equipment profile is published by the ESP32 as retained public metadata.
+app.get("/api/icemaker/:deviceId/profile",(req,res)=>{
+  const id=cleanDeviceId(req.params.deviceId);
+  if(!deviceAllowed(id))return res.status(403).json({error:"Device not allowed"});
+  res.json(publicIceProfile(getIceProfile(id)));
+});
+app.post("/api/icemaker/:deviceId/settings/login",async(req,res)=>{
+  const id=cleanDeviceId(req.params.deviceId);
+  if(!deviceAllowed(id))return res.status(403).json({error:"Device not allowed"});
+  const key=`${id}:${req.ip}`;
+  const attempt=iceLoginAttempts.get(key)||{count:0,until:0};
+  if(attempt.until>Date.now())return res.status(429).json({error:"Too many attempts. Try again later."});
+  const password=String(req.body?.password||"");
+  if(password.length<7||password.length>128)return res.status(400).json({error:"Invalid password length"});
+  try{
+    const valid=await verifyIcePassword(id,password);
+    if(!valid){attempt.count++;if(attempt.count>=5){attempt.count=0;attempt.until=Date.now()+5*60*1000;}iceLoginAttempts.set(key,attempt);return res.status(401).json({error:"Incorrect password"});}
+    iceLoginAttempts.delete(key);
+    const token=randomBytes(32).toString("hex");
+    iceSessions.set(token,{id,password,expires:Date.now()+ICE_SESSION_MS});
+    res.json({ok:true,token});
+  }catch(err){res.status(503).json({error:err.message});}
+});
+app.put("/api/icemaker/:deviceId/profile",async(req,res)=>{
+  const id=cleanDeviceId(req.params.deviceId);
+  if(!deviceAllowed(id))return res.status(403).json({error:"Device not allowed"});
+  const session=iceRequireAuth(req,res,id);if(!session)return;
+  const body=req.body||{};
+  const model=String(body.model||"").trim();
+  const location=String(body.location||"").trim();
+  const manufactured=String(body.manufactured||"").trim();
+  const capacity=body.capacity===""||body.capacity==null?0:Number(body.capacity);
+  if(model.length>64||location.length>96)return res.status(400).json({error:"Model (64) or location (96) is too long"});
+  if(manufactured && !/^\d{4}-\d{2}-\d{2}$/.test(manufactured))return res.status(400).json({error:"Manufacturing date must be YYYY-MM-DD"});
+  if(!Number.isFinite(capacity)||capacity<0||capacity>10000)return res.status(400).json({error:"Invalid capacity"});
+  const wanted={model,location,manufactured,capacity};
+  try{
+    const confirmed=await Promise.all([awaitIceProfile(id,p=>Object.keys(wanted).every(k=>String(p[k])===String(wanted[k]))),publishIceUpdate(id,{password:session.password,...wanted})]);
+    res.json({ok:true,profile:publicIceProfile(confirmed[0])});
+  }catch(err){res.status(504).json({error:err.message});}
+});
+app.post("/api/icemaker/:deviceId/settings/password",async(req,res)=>{
+  const id=cleanDeviceId(req.params.deviceId);
+  if(!deviceAllowed(id))return res.status(403).json({error:"Device not allowed"});
+  const session=iceRequireAuth(req,res,id);if(!session)return;
+  const newPassword=String(req.body?.newPassword||"");
+  if(newPassword.length<8||newPassword.length>128)return res.status(400).json({error:"New password must be 8 to 128 characters"});
+  try{
+    await publishIceUpdate(id,{password:session.password,newPassword});
+    // Firmware does not provide a dedicated write acknowledgement. Verify the NEW credential.
+    let valid=false;
+    for(let i=0;i<4;i++){
+      await new Promise(resolve=>setTimeout(resolve,400));
+      valid=await verifyIcePassword(id,newPassword);
+      if(valid)break;
+    }
+    if(!valid)return res.status(504).json({error:"ESP32 did not confirm the new password"});
+    // Invalidate other sessions for this device after a password change.
+    for(const [token,record] of iceSessions)if(record.id===id)iceSessions.delete(token);
+    res.json({ok:true,relogin:true});
+  }catch(err){res.status(504).json({error:err.message});}
+});
 app.post("/api/icemaker/:deviceId/cmd/:command", (req,res) => {
   const id=cleanDeviceId(req.params.deviceId);
   if (!deviceAllowed(id)) return res.status(403).json({error:"Device not allowed"});
   const command=String(req.params.command||"");
   if (!Object.prototype.hasOwnProperty.call(ICE_COMMANDS,command)) return res.status(400).json({error:"Unsupported Ice Maker command"});
   if (!iceStatuses.has(id)) return res.status(409).json({error:"Ice Maker status not received yet"});
+  if (["displaybright","overheatthresh","drytime","icingtime","deliverytime"].includes(command) && !iceRequireAuth(req,res,id)) return;
   let value=req.body?.value;
   if (value===undefined || value===null) return res.status(400).json({error:"Missing value"});
   if (command==="power" || command==="leds") {
